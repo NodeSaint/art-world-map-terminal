@@ -2,6 +2,8 @@
 
 A beautiful, responsive world map rendered directly in your terminal using Unicode block characters and 24-bit ANSI truecolor. Pure Node.js, zero dependencies.
 
+**[Try it in your browser](https://nodesaint.github.io/art-world-map-terminal/)** — a terminal-style web interface where you type `run` to render the map.
+
 ```
   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
   ░░░░░░░░░░░░░░░░░░░▓▓░░░░░░▓▓▓▓░░░░░░░░░░░░░░░░░░░
@@ -19,9 +21,8 @@ A beautiful, responsive world map rendered directly in your terminal using Unico
 ## Installation
 
 ```bash
-# Clone and link
-git clone <repo-url>
-cd terra
+git clone https://github.com/NodeSaint/art-world-map-terminal.git
+cd art-world-map-terminal
 npm link
 
 # Then run from anywhere
