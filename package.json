@@ -1,0 +1,11 @@
+{
+  "name": "terra-cli",
+  "version": "1.0.0",
+  "description": "A beautiful, responsive world map rendered in the terminal using Unicode block characters and ANSI truecolor",
+  "bin": {
+    "terra": "./bin/terra.js"
+  },
+  "main": "bin/terra.js",
+  "keywords": ["cli", "terminal", "map", "world", "ansi", "unicode"],
+  "license": "MIT"
+}
