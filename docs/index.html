@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>terra — world map in your terminal</title>
+<meta name="description" content="A beautiful world map rendered in your browser terminal. Type 'run' to see the world.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0a0f;
+    color: #8a9a96;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    font-size: clamp(9px, 1.4vw, 14px);
+    line-height: 1.35;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #window {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    width: 100vw;
+    border: 1px solid #1a1a2e;
+  }
+
+  #titlebar {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    background: #12121e;
+    border-bottom: 1px solid #1a1a2e;
+    flex-shrink: 0;
+    gap: 8px;
+  }
+
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot-red { background: #ff5f56; }
+  .dot-yellow { background: #ffbd2e; }
+  .dot-green { background: #27c93f; }
+
+  #titlebar-text {
+    color: #555;
+    font-size: 11px;
+    margin-left: 8px;
+  }
+
+  #terminal {
+    flex: 1;
+    padding: 12px 16px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    position: relative;
+  }
+
+  /* Subtle CRT scanlines */
+  #terminal::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.03) 2px,
+      rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  #output {
+    white-space: pre;
+    word-break: break-all;
+  }
+
+  .map-row {
+    white-space: pre;
+    line-height: 1.18;
+    height: 1.18em;
+  }
+
+  #input-line {
+    display: flex;
+    white-space: pre;
+    margin-top: 2px;
+  }
+
+  .prompt {
+    color: #5a8a5a;
+  }
+
+  #input-text {
+    color: #c0d0c8;
+  }
+
+  #cursor {
+    color: #c0d0c8;
+    animation: blink 1s step-end infinite;
+  }
+
+  #hint {
+    color: #3a4a46;
+    pointer-events: none;
+  }
+
+  @keyframes blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+
+  .text-dim { color: #445; }
+  .text-green { color: #5a8a5a; }
+  .text-bright { color: #c0d0c8; }
+  .text-cyan { color: #5aaa9a; }
+  .text-yellow { color: #aa9a5a; }
+
+  ::selection {
+    background: rgba(90, 138, 90, 0.3);
+    color: #c0d0c8;
+  }
+
+  #terminal::-webkit-scrollbar { width: 6px; }
+  #terminal::-webkit-scrollbar-track { background: transparent; }
+  #terminal::-webkit-scrollbar-thumb { background: #1a1a2e; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="window">
+  <div id="titlebar">
+    <div class="dot dot-red"></div>
+    <div class="dot dot-yellow"></div>
+    <div class="dot dot-green"></div>
+    <span id="titlebar-text">terra &mdash; visitor@terra:~</span>
+  </div>
+  <div id="terminal">
+    <div id="output"></div>
+    <div id="input-line">
+      <span class="prompt">visitor@terra:~$ </span><span id="input-text"></span><span id="cursor">&#x2588;</span><span id="hint"> type &quot;run&quot; to render the map</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// terra — browser terminal world map
+// ============================================================
+
+// --- State ---
+const state = {
+  theme: 'midnight',
+  zoom: 1,
+  centreLat: 0,
+  centreLon: 0,
+  projection: 'mercator',
+  showGrid: false,
+  showLabels: false,
+  showBorders: true,
+};
+
+let inputBuffer = '';
+let commandHistory = [];
+let historyIndex = -1;
+let countriesCache = null;
+let dataPromise = null;
+let inputEnabled = false;
+let rendering = false;
+
+const outputEl = document.getElementById('output');
+const inputTextEl = document.getElementById('input-text');
+const cursorEl = document.getElementById('cursor');
+const hintEl = document.getElementById('hint');
+const terminalEl = document.getElementById('terminal');
+
+// --- Preload GeoJSON immediately ---
+dataPromise = fetch('data/world.json')
+  .then(r => r.json())
+  .then(geojson => {
+    countriesCache = parseGeoJSON(geojson);
+    return countriesCache;
+  });
+
+// ============================================================
+// GeoJSON Parser (ported from lib/geodata.js)
+// ============================================================
+function parseGeoJSON(geojson) {
+  return geojson.features.map((feature, index) => {
+    const props = feature.properties;
+    const name = props.NAME || props.ADMIN || 'Unknown';
+    const iso = props.ISO_A3 && props.ISO_A3 !== '-99' ? props.ISO_A3 : (props.ADM0_A3 || '???');
+    const polygons = extractPolygons(feature.geometry);
+
+    let centroid = [0, 0];
+    if (polygons.length > 0 && polygons[0].length > 0) {
+      const ring = polygons[0];
+      let sumLon = 0, sumLat = 0;
+      for (const [lon, lat] of ring) { sumLon += lon; sumLat += lat; }
+      centroid = [sumLon / ring.length, sumLat / ring.length];
+    }
+    return { name, iso, index, polygons, centroid };
+  });
+}
+
+function extractPolygons(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === 'Polygon') {
+    return geometry.coordinates.map(ring => ring.map(([lon, lat]) => [lon, lat]));
+  }
+  if (geometry.type === 'MultiPolygon') {
+    const result = [];
+    for (const polygon of geometry.coordinates) {
+      result.push(polygon[0].map(([lon, lat]) => [lon, lat]));
+    }
+    return result;
+  }
+  return [];
+}
+
+// ============================================================
+// Projection (ported from lib/projection.js)
+// ============================================================
+const PI = Math.PI;
+const DEG2RAD = PI / 180;
+const MAX_LAT = 85.051129;
+
+function clampLat(lat) { return Math.max(-MAX_LAT, Math.min(MAX_LAT, lat)); }
+
+function mercator(lon, lat) {
+  lat = clampLat(lat);
+  const x = (lon + 180) / 360;
+  const latRad = lat * DEG2RAD;
+  const y = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) / 2;
+  return [x, y];
+}
+
+function equirectangular(lon, lat) {
+  lat = clampLat(lat);
+  const x = (lon + 180) / 360;
+  const y = (90 - lat) / 180;
+  return [x, y];
+}
+
+function createProjector(opts) {
+  const { projection = 'mercator', centreLon = 0, centreLat = 0, zoom = 1, width, height } = opts;
+  const projFn = projection === 'equirectangular' ? equirectangular : mercator;
+  const [cx, cy] = projFn(centreLon, centreLat);
+
+  return function project(lon, lat) {
+    const [nx, ny] = projFn(lon, lat);
+    const px = (nx - cx) * zoom + 0.5;
+    const py = (ny - cy) * zoom + 0.5;
+    return [Math.round(px * width), Math.round(py * height)];
+  };
+}
+
+// ============================================================
+// Themes (ported from lib/themes.js)
+// ============================================================
+const themes = {
+  midnight: {
+    name: 'midnight', ocean: [10, 15, 36], land: [58, 90, 64], landRange: 30,
+    border: [80, 120, 88], grid: [30, 40, 60], text: [140, 160, 150],
+  },
+  hacker: {
+    name: 'hacker', ocean: [0, 0, 0], land: [0, 180, 0], landRange: 40,
+    border: [0, 255, 0], grid: [0, 50, 0], text: [0, 255, 0],
+  },
+  satellite: {
+    name: 'satellite', ocean: [15, 30, 60], land: [120, 100, 70], landRange: 35,
+    border: [140, 120, 90], grid: [40, 55, 80], text: [200, 190, 170],
+  },
+  vapor: {
+    name: 'vapor', ocean: [40, 10, 60], land: [0, 200, 200], landRange: 40,
+    border: [100, 255, 255], grid: [60, 20, 80], text: [255, 100, 200],
+  },
+  paper: {
+    name: 'paper', ocean: [235, 230, 220], land: [245, 240, 230], landRange: 10,
+    border: [80, 80, 80], grid: [200, 195, 185], text: [60, 60, 60],
+  },
+  heat: {
+    name: 'heat', ocean: [10, 15, 36], land: [200, 100, 50], landRange: 0,
+    border: [220, 130, 70], grid: [30, 40, 60], text: [240, 220, 200],
+    heatMode: true,
+  },
+};
+
+function getLandColour(theme, countryIndex, lat) {
+  if (theme.heatMode) {
+    const t = Math.max(0, Math.min(1, (lat + 80) / 160));
+    return [
+      Math.round(30 + 220 * t),
+      Math.round(80 + 120 * Math.sin(t * PI)),
+      Math.round(220 - 200 * t),
+    ];
+  }
+  const base = theme.land;
+  const range = theme.landRange;
+  const hash = ((countryIndex * 137 + 43) % 256) / 256;
+  const offset = Math.round((hash - 0.5) * range);
+  return [
+    Math.max(0, Math.min(255, base[0] + offset)),
+    Math.max(0, Math.min(255, base[1] + offset + Math.round((hash * 47) % 15) - 7)),
+    Math.max(0, Math.min(255, base[2] + offset - Math.round((hash * 31) % 10) + 5)),
+  ];
+}
+
+// ============================================================
+// Grid (ported from lib/grid.js)
+// ============================================================
+function drawGrid(pixelGrid, width, height, project, theme, zoom) {
+  const gridColour = theme.grid;
+  let spacing = 30;
+  if (zoom >= 3) spacing = 15;
+  if (zoom >= 6) spacing = 10;
+  if (zoom >= 8) spacing = 5;
+
+  for (let lon = -180; lon <= 180; lon += spacing) {
+    for (let py = 0; py < height; py++) {
+      const lat = 85 - (py / height) * 170;
+      const [x, y] = project(lon, lat);
+      if (x >= 0 && x < width && y >= 0 && y < height && y % 3 === 0) {
+        const existing = pixelGrid[y][x];
+        if (!existing || existing.type === 'ocean') {
+          pixelGrid[y][x] = { type: 'grid', colour: gridColour };
+        }
+      }
+    }
+  }
+
+  for (let lat = -60; lat <= 80; lat += spacing) {
+    for (let px = 0; px < width; px++) {
+      const lon = -180 + (px / width) * 360;
+      const [x, y] = project(lon, lat);
+      if (x >= 0 && x < width && y >= 0 && y < height && x % 3 === 0) {
+        const existing = pixelGrid[y][x];
+        if (!existing || existing.type === 'ocean') {
+          pixelGrid[y][x] = { type: 'grid', colour: gridColour };
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// Labels (ported from lib/labels.js)
+// ============================================================
+function drawLabels(pixelGrid, width, height, countries, project, theme, zoom) {
+  const textColour = theme.text;
+  for (const country of countries) {
+    const [lon, lat] = country.centroid;
+    const [cx, cy] = project(lon, lat);
+    const label = zoom >= 4 ? country.name : country.iso;
+    if (!label || label === '???') continue;
+    const startX = Math.round(cx - label.length / 2);
+    const y = cy;
+    if (y < 0 || y >= height || cx < 0 || cx >= width) continue;
+    const centrePixel = pixelGrid[y] && pixelGrid[y][Math.round(cx)];
+    if (!centrePixel || centrePixel.type !== 'land') continue;
+    for (let i = 0; i < label.length; i++) {
+      const x = startX + i;
+      if (x < 0 || x >= width || y < 0 || y >= height) continue;
+      pixelGrid[y][x] = {
+        type: 'label', char: label[i], colour: textColour,
+        bg: pixelGrid[y][x] ? pixelGrid[y][x].colour : theme.ocean,
+      };
+    }
+  }
+}
+
+// ============================================================
+// Point-in-Polygon & Line Drawing (ported from lib/renderer.js)
+// ============================================================
+function pointInPolygon(px, py, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+    const intersect = ((yi > py) !== (yj > py)) &&
+      (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function drawLine(pixelGrid, width, height, x0, y0, x1, y1, colour) {
+  x0 = Math.round(x0); y0 = Math.round(y0);
+  x1 = Math.round(x1); y1 = Math.round(y1);
+  if (Math.abs(x1 - x0) > width * 0.5) return;
+  const dx = Math.abs(x1 - x0);
+  const dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  let steps = 0;
+  const maxSteps = dx + dy + 1;
+  while (steps++ < maxSteps) {
+    if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
+      const existing = pixelGrid[y0][x0];
+      if (existing && existing.type === 'land') {
+        pixelGrid[y0][x0] = { type: 'border', colour };
+      }
+    }
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 < dx) { err += dx; y0 += sy; }
+  }
+}
+
+// ============================================================
+// Core Render Pipeline
+// ============================================================
+function computeGridSize() {
+  // Measure character dimensions
+  const testEl = document.createElement('span');
+  testEl.textContent = 'X';
+  testEl.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;';
+  terminalEl.appendChild(testEl);
+  const charWidth = testEl.getBoundingClientRect().width;
+  const charHeight = testEl.getBoundingClientRect().height;
+  terminalEl.removeChild(testEl);
+
+  const availWidth = terminalEl.clientWidth - 32;
+  const availHeight = terminalEl.clientHeight * 0.78;
+
+  const cols = Math.max(40, Math.floor(availWidth / charWidth));
+  const rows = Math.max(10, Math.floor(availHeight / (charHeight * 1.18))); // account for line-height
+
+  return { cols, rows };
+}
+
+function buildPixelGrid(countries) {
+  const { cols, rows } = computeGridSize();
+  const width = cols;
+  const termHeight = rows;
+  const height = termHeight * 2;
+
+  const theme = themes[state.theme] || themes.midnight;
+
+  // Create pixel grid
+  const pixelGrid = new Array(height);
+  for (let y = 0; y < height; y++) {
+    pixelGrid[y] = new Array(width);
+    for (let x = 0; x < width; x++) {
+      pixelGrid[y][x] = { type: 'ocean', colour: theme.ocean };
+    }
+  }
+
+  const project = createProjector({
+    projection: state.projection,
+    centreLon: state.centreLon,
+    centreLat: state.centreLat,
+    zoom: state.zoom,
+    width, height,
+  });
+
+  // Fill countries
+  for (const country of countries) {
+    const countryColour = getLandColour(theme, country.index, country.centroid[1]);
+    for (const polygon of country.polygons) {
+      const projected = polygon.map(([lon, lat]) => project(lon, lat));
+
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const [x, y] of projected) {
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+
+      minX = Math.max(0, Math.floor(minX));
+      maxX = Math.min(width - 1, Math.ceil(maxX));
+      minY = Math.max(0, Math.floor(minY));
+      maxY = Math.min(height - 1, Math.ceil(maxY));
+
+      if (minX > width || maxX < 0 || minY > height || maxY < 0) continue;
+      if (maxX - minX > width * 0.8 && state.zoom <= 2) continue;
+
+      for (let py = minY; py <= maxY; py++) {
+        for (let px = minX; px <= maxX; px++) {
+          if (pointInPolygon(px, py, projected)) {
+            pixelGrid[py][px] = { type: 'land', colour: countryColour, countryIndex: country.index };
+          }
+        }
+      }
+
+      if (state.showBorders && width >= 60) {
+        for (let i = 0; i < projected.length - 1; i++) {
+          drawLine(pixelGrid, width, height,
+            projected[i][0], projected[i][1],
+            projected[i + 1][0], projected[i + 1][1],
+            theme.border);
+        }
+      }
+    }
+  }
+
+  if (state.showGrid) drawGrid(pixelGrid, width, height, project, theme, state.zoom);
+  if (state.showLabels) drawLabels(pixelGrid, width, height, countries, project, theme, state.zoom);
+
+  return { pixelGrid, width, height, termHeight, theme };
+}
+
+// Convert pixel grid to array of HTML row strings
+function renderToHTMLRows(pixelGrid, width, height, termHeight) {
+  const rows = [];
+
+  for (let row = 0; row < termHeight; row++) {
+    const topY = row * 2;
+    const botY = row * 2 + 1;
+    let html = '';
+    let batchChar = '';
+    let batchFg = '';
+    let batchBg = '';
+
+    function flushBatch() {
+      if (batchChar.length > 0) {
+        // Escape HTML entities
+        const safe = batchChar.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        if (batchFg) {
+          html += '<span style="color:' + batchFg + ';background:' + batchBg + '">' + safe + '</span>';
+        } else {
+          html += '<span style="background:' + batchBg + '">' + safe + '</span>';
+        }
+        batchChar = '';
+        batchFg = '';
+        batchBg = '';
+      }
+    }
+
+    for (let x = 0; x < width; x++) {
+      const top = pixelGrid[topY] && pixelGrid[topY][x];
+      const bot = pixelGrid[botY] && pixelGrid[botY][x];
+
+      if (!top || !bot) {
+        const curFg = '';
+        const curBg = 'rgb(0,0,0)';
+        const ch = ' ';
+        if (curFg !== batchFg || curBg !== batchBg) { flushBatch(); batchFg = curFg; batchBg = curBg; }
+        batchChar += ch;
+        continue;
+      }
+
+      // Labels
+      if (top.type === 'label') {
+        const curFg = 'rgb(' + top.colour.join(',') + ')';
+        const bgC = top.bg || [0,0,0];
+        const curBg = 'rgb(' + bgC.join(',') + ')';
+        if (curFg !== batchFg || curBg !== batchBg) { flushBatch(); batchFg = curFg; batchBg = curBg; }
+        batchChar += top.char;
+        continue;
+      }
+
+      const topC = top.colour;
+      const botC = bot.colour;
+      const topKey = topC[0] + ',' + topC[1] + ',' + topC[2];
+      const botKey = botC[0] + ',' + botC[1] + ',' + botC[2];
+
+      if (topKey === botKey) {
+        // Same colour — space with background
+        const curFg = '';
+        const curBg = 'rgb(' + topKey + ')';
+        if (curFg !== batchFg || curBg !== batchBg) { flushBatch(); batchFg = curFg; batchBg = curBg; }
+        batchChar += ' ';
+      } else {
+        // Half block: fg = top, bg = bottom
+        const curFg = 'rgb(' + topKey + ')';
+        const curBg = 'rgb(' + botKey + ')';
+        if (curFg !== batchFg || curBg !== batchBg) { flushBatch(); batchFg = curFg; batchBg = curBg; }
+        batchChar += '\u2580'; // ▀
+      }
+    }
+    flushBatch();
+    rows.push(html);
+  }
+
+  return rows;
+}
+
+// ============================================================
+// Terminal I/O
+// ============================================================
+function rgb(r, g, b) { return 'rgb(' + r + ',' + g + ',' + b + ')'; }
+
+function appendOutput(html) {
+  outputEl.innerHTML += html + '\n';
+  scrollToBottom();
+}
+
+function appendText(text, className) {
+  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (className) {
+    appendOutput('<span class="' + className + '">' + escaped + '</span>');
+  } else {
+    appendOutput(escaped);
+  }
+}
+
+function scrollToBottom() {
+  terminalEl.scrollTop = terminalEl.scrollHeight;
+}
+
+function updateInput() {
+  inputTextEl.textContent = inputBuffer;
+  hintEl.style.display = inputBuffer.length > 0 ? 'none' : '';
+}
+
+// ============================================================
+// Commands
+// ============================================================
+async function processCommand(input) {
+  const trimmed = input.trim();
+  if (!trimmed) return;
+
+  commandHistory.unshift(trimmed);
+  if (commandHistory.length > 50) commandHistory.pop();
+  historyIndex = -1;
+
+  const parts = trimmed.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  switch (cmd) {
+    case 'run':
+    case 'render':
+      await renderMap();
+      break;
+
+    case 'theme':
+      if (parts[1]) {
+        const name = parts[1].toLowerCase();
+        if (themes[name]) {
+          state.theme = name;
+          appendText('Theme set to ' + name + '.', 'text-green');
+        } else {
+          appendText('Unknown theme: ' + parts[1], 'text-yellow');
+          appendText('Available: ' + Object.keys(themes).join(', '), 'text-dim');
+        }
+      } else {
+        appendText('Available themes: ' + Object.keys(themes).join(', '), 'text-cyan');
+        appendText('Current: ' + state.theme, 'text-dim');
+      }
+      break;
+
+    case 'zoom':
+      if (parts[1]) {
+        const z = parseFloat(parts[1]);
+        if (z >= 1 && z <= 10) {
+          state.zoom = z;
+          appendText('Zoom set to ' + z + 'x.', 'text-green');
+        } else {
+          appendText('Zoom must be between 1 and 10.', 'text-yellow');
+        }
+      } else {
+        appendText('Current zoom: ' + state.zoom + 'x', 'text-dim');
+      }
+      break;
+
+    case 'center':
+    case 'centre':
+      if (parts[1]) {
+        const coords = parts[1].split(',');
+        const lat = parseFloat(coords[0]);
+        const lon = parseFloat(coords[1]);
+        if (!isNaN(lat) && !isNaN(lon)) {
+          state.centreLat = Math.max(-85, Math.min(85, lat));
+          state.centreLon = Math.max(-180, Math.min(180, lon));
+          appendText('Centre set to ' + state.centreLat.toFixed(1) + '\u00b0, ' + state.centreLon.toFixed(1) + '\u00b0.', 'text-green');
+        } else {
+          appendText('Usage: center <lat>,<lon>  (e.g. center 51.5,-0.1)', 'text-yellow');
+        }
+      } else {
+        appendText('Current centre: ' + state.centreLat.toFixed(1) + '\u00b0, ' + state.centreLon.toFixed(1) + '\u00b0', 'text-dim');
+      }
+      break;
+
+    case 'projection':
+      if (parts[1]) {
+        const p = parts[1].toLowerCase();
+        if (p === 'mercator' || p === 'equirectangular') {
+          state.projection = p;
+          appendText('Projection set to ' + p + '.', 'text-green');
+        } else {
+          appendText('Available: mercator, equirectangular', 'text-yellow');
+        }
+      } else {
+        appendText('Current projection: ' + state.projection, 'text-dim');
+      }
+      break;
+
+    case 'grid':
+      state.showGrid = !state.showGrid;
+      appendText('Grid ' + (state.showGrid ? 'enabled' : 'disabled') + '.', 'text-green');
+      break;
+
+    case 'labels':
+      state.showLabels = !state.showLabels;
+      appendText('Labels ' + (state.showLabels ? 'enabled' : 'disabled') + '.', 'text-green');
+      break;
+
+    case 'borders':
+      state.showBorders = !state.showBorders;
+      appendText('Borders ' + (state.showBorders ? 'enabled' : 'disabled') + '.', 'text-green');
+      break;
+
+    case 'reset':
+      state.theme = 'midnight';
+      state.zoom = 1;
+      state.centreLat = 0;
+      state.centreLon = 0;
+      state.projection = 'mercator';
+      state.showGrid = false;
+      state.showLabels = false;
+      state.showBorders = true;
+      appendText('Reset to defaults.', 'text-green');
+      break;
+
+    case 'clear':
+      outputEl.innerHTML = '';
+      break;
+
+    case 'help':
+      showHelp();
+      break;
+
+    case 'about':
+      appendText('terra v1.0.0', 'text-bright');
+      appendText('A beautiful world map rendered in your terminal.', 'text-dim');
+      appendText('Pure JavaScript. Zero dependencies. Natural Earth data.', 'text-dim');
+      appendText('github.com/NodeSaint/art-world-map-terminal', 'text-cyan');
+      break;
+
+    default:
+      appendText('Unknown command: ' + cmd, 'text-yellow');
+      appendText('Type "help" for available commands.', 'text-dim');
+  }
+}
+
+function showHelp() {
+  const lines = [
+    ['run', 'Render the world map'],
+    ['theme [name]', 'Set or list colour themes'],
+    ['zoom <1-10>', 'Set zoom level'],
+    ['center <lat>,<lon>', 'Centre the map (e.g. center 51.5,-0.1)'],
+    ['projection [name]', 'Set projection (mercator, equirectangular)'],
+    ['grid', 'Toggle grid lines'],
+    ['labels', 'Toggle country labels'],
+    ['borders', 'Toggle country borders'],
+    ['reset', 'Reset all settings'],
+    ['clear', 'Clear terminal'],
+    ['about', 'About terra'],
+    ['help', 'Show this help'],
+  ];
+
+  appendText('Available commands:', 'text-bright');
+  appendOutput('');
+  for (const [cmd, desc] of lines) {
+    const padded = ('  ' + cmd).padEnd(28);
+    appendOutput('<span class="text-cyan">' + padded + '</span><span class="text-dim">' + desc + '</span>');
+  }
+  appendOutput('');
+  appendText('Tip: try "theme vapor" then "run", or "center 35.6,139.7" then "zoom 3" then "run"', 'text-dim');
+}
+
+async function renderMap() {
+  if (rendering) return;
+  rendering = true;
+
+  appendText('Rendering...', 'text-dim');
+
+  // Ensure data is loaded
+  if (!countriesCache) {
+    try {
+      await dataPromise;
+    } catch (e) {
+      appendText('Failed to load world data: ' + e.message, 'text-yellow');
+      rendering = false;
+      return;
+    }
+  }
+
+  // Yield to let "Rendering..." appear
+  await new Promise(r => setTimeout(r, 10));
+
+  const { pixelGrid, width, height, termHeight, theme } = buildPixelGrid(countriesCache);
+  const htmlRows = renderToHTMLRows(pixelGrid, width, height, termHeight);
+
+  // Remove the "Rendering..." line
+  const lines = outputEl.innerHTML.split('\n');
+  lines.pop(); // trailing empty
+  lines.pop(); // "Rendering..."
+  outputEl.innerHTML = lines.join('\n') + '\n';
+
+  // Line-by-line reveal
+  let i = 0;
+  function drawNextRow() {
+    if (i >= htmlRows.length) {
+      // Done — add a blank line after the map
+      appendOutput('');
+      rendering = false;
+      scrollToBottom();
+      return;
+    }
+
+    const rowDiv = '<div class="map-row">' + htmlRows[i] + '</div>';
+    // We append raw HTML directly (no extra newline since map-row is block)
+    outputEl.innerHTML += rowDiv;
+    scrollToBottom();
+    i++;
+    setTimeout(drawNextRow, 12);
+  }
+
+  drawNextRow();
+}
+
+// ============================================================
+// Keyboard Input
+// ============================================================
+document.addEventListener('keydown', (e) => {
+  if (!inputEnabled || rendering) return;
+
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const cmd = inputBuffer;
+    inputBuffer = '';
+    updateInput();
+
+    // Freeze the command into output
+    appendOutput('<span class="prompt">visitor@terra:~$ </span><span class="text-bright">' +
+      cmd.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span>');
+
+    processCommand(cmd);
+
+  } else if (e.key === 'Backspace') {
+    e.preventDefault();
+    inputBuffer = inputBuffer.slice(0, -1);
+    updateInput();
+
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (historyIndex < commandHistory.length - 1) {
+      historyIndex++;
+      inputBuffer = commandHistory[historyIndex];
+      updateInput();
+    }
+
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (historyIndex > 0) {
+      historyIndex--;
+      inputBuffer = commandHistory[historyIndex];
+    } else {
+      historyIndex = -1;
+      inputBuffer = '';
+    }
+    updateInput();
+
+  } else if (e.key === 'Tab') {
+    e.preventDefault();
+    // Simple tab completion
+    const commands = ['run', 'theme', 'zoom', 'center', 'centre', 'projection', 'grid', 'labels', 'borders', 'reset', 'clear', 'help', 'about'];
+    const match = commands.filter(c => c.startsWith(inputBuffer.toLowerCase()));
+    if (match.length === 1) {
+      inputBuffer = match[0];
+      updateInput();
+    }
+
+  } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    inputBuffer += e.key;
+    updateInput();
+  }
+});
+
+// Also handle paste
+document.addEventListener('paste', (e) => {
+  if (!inputEnabled || rendering) return;
+  e.preventDefault();
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  inputBuffer += text.replace(/\n/g, '');
+  updateInput();
+});
+
+// ============================================================
+// Startup Sequence
+// ============================================================
+async function startup() {
+  const introLines = [
+    { text: '', delay: 200 },
+    { text: 'terra v1.0.0', cls: 'text-bright', delay: 40 },
+    { text: 'A world map in your terminal.', cls: 'text-dim', delay: 30 },
+    { text: '', delay: 150 },
+    { text: 'Type "help" for commands, or just type "run".', cls: 'text-green', delay: 25 },
+    { text: '', delay: 100 },
+  ];
+
+  for (const line of introLines) {
+    if (!line.text) {
+      appendOutput('');
+      await sleep(line.delay || 100);
+      continue;
+    }
+
+    // Typewriter effect
+    let el = document.createElement('span');
+    if (line.cls) el.className = line.cls;
+    const lineDiv = document.createElement('div');
+    lineDiv.appendChild(el);
+    outputEl.appendChild(lineDiv);
+
+    for (let i = 0; i < line.text.length; i++) {
+      el.textContent += line.text[i];
+      scrollToBottom();
+      await sleep(line.delay || 30);
+    }
+    await sleep(80);
+  }
+
+  inputEnabled = true;
+  scrollToBottom();
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Prevent default scrolling behavior for space/arrow keys
+window.addEventListener('keydown', (e) => {
+  if (['ArrowUp', 'ArrowDown', 'Tab', ' '].includes(e.key) && inputEnabled) {
+    if (e.key === ' ' && !rendering) return; // allow space in input
+    if (e.key !== ' ') e.preventDefault();
+  }
+});
+
+// Focus management — click terminal to ensure keyboard works
+terminalEl.addEventListener('click', () => {
+  // Keyboard events are on document, just scroll to bottom
+  scrollToBottom();
+});
+
+// Start
+startup();
+</script>
+</body>
+</html>
